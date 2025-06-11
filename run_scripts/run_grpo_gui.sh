@@ -12,6 +12,11 @@ echo "image_folders: $image_folders"
 
 export EXP_NAME="GUI-multi-image" # TODO: change this to your own experiment name
 TASK_TYPE="gui"
+
+# Enable RLLoggingBoard data collection
+export SAVE_ROLLOUT_DATA="true"  # Set to "false" to disable data collection
+echo "RLLoggingBoard data collection: $SAVE_ROLLOUT_DATA"
+
 cd ${REPO_HOME}/src/open-r1-multimodal
 
 export DEBUG_MODE="true" # Enable Debug if you want to see the rollout of model during RL

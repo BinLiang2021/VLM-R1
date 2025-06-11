@@ -14,6 +14,7 @@
 
 import os
 import textwrap
+import json
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union, Sized
 
@@ -359,9 +360,23 @@ class VLMGRPOTrainer(Trainer):
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
 
-        # Data collator
+        # Configure multi-modal inputs
+        multimodal_keywords = vlm_module.get_custom_multimodal_keywords()
+        
+        # Create a data collator for the different datasets
         def data_collator(features):  # No data collation is needed in GRPO
             return features
+
+        # Find a unique path for saving RLLoggingBoard data
+        self.rollout_data_dir = None
+        self.save_rollout_data = os.getenv("SAVE_ROLLOUT_DATA", "false").lower() == "true"
+        if self.save_rollout_data:
+            # Create rollout_samples directory structure
+            base_dir = os.path.join(args.output_dir, "rollout_samples")
+            exp_name = os.getenv("EXP_NAME", "experiment")
+            self.rollout_data_dir = os.path.join(base_dir, exp_name)
+            os.makedirs(self.rollout_data_dir, exist_ok=True)
+            print(f"RLLoggingBoard: Saving rollout data to {self.rollout_data_dir}")
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
@@ -410,6 +425,9 @@ class VLMGRPOTrainer(Trainer):
             processing_class=processing_class,
             callbacks=callbacks,
             optimizers=optimizers,
+            preprocess_logits_for_metrics=None,
+            compute_metrics=None,
+            **kwargs,
         )
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
@@ -512,12 +530,89 @@ class VLMGRPOTrainer(Trainer):
         return inputs
 
     def _get_key_from_inputs(self, x, key):
-        ele = x.get(key, None)
-        assert ele is not None, f"The key {key} is not found in the input"
-        if isinstance(ele, list):
-            return [e for e in ele]
+        if isinstance(x[key], list):
+            return x[key]
+        elif isinstance(x[key], torch.Tensor):
+            return x[key].detach().cpu().tolist()
         else:
-            return [ele]
+            return [x[key]]
+    
+    def _save_rollout_data(self, inputs, outputs, step):
+        """Save rollout data for RLLoggingBoard visualization"""
+        if not self.save_rollout_data or self.rollout_data_dir is None:
+            return
+            
+        try:
+            prompts = [x["prompt"] for x in inputs]
+            completion_ids = outputs["completion_ids"]
+            completion_mask = outputs["completion_mask"]
+            ref_per_token_logps = outputs.get("ref_per_token_logps")
+            per_token_logps = outputs.get("per_token_logps")  # We'll need to pass this from compute_loss
+            
+            # Decode completions 
+            completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            
+            # Convert to text prompts
+            prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)
+            
+            rollout_samples = []
+            
+            for i in range(len(prompts)):
+                # Get the response and mask for this sample
+                completion_ids_i = completion_ids[i]
+                completion_mask_i = completion_mask[i]
+                
+                # Get valid tokens (where mask is True)
+                valid_indices = completion_mask_i.bool()
+                valid_completion_ids = completion_ids_i[valid_indices]
+                
+                # Convert tokens to strings
+                response_tokens = self.processing_class.convert_ids_to_tokens(valid_completion_ids.tolist())
+                
+                # Get logprobs for valid tokens
+                logprobs = []
+                ref_logprobs = []
+                
+                if per_token_logps is not None and i < per_token_logps.size(0):
+                    valid_logprobs = per_token_logps[i][valid_indices]
+                    logprobs = valid_logprobs.detach().cpu().tolist()
+                
+                if ref_per_token_logps is not None and i < ref_per_token_logps.size(0):
+                    valid_ref_logprobs = ref_per_token_logps[i][valid_indices]
+                    ref_logprobs = valid_ref_logprobs.detach().cpu().tolist()
+                
+                # Create sample for RLLogging Board
+                sample = {
+                    "prompt": prompts_text[i] if i < len(prompts_text) else str(prompts[i]),
+                    "response": completions[i],
+                    "response_tokens": response_tokens,
+                    "logprobs": logprobs,
+                    "ref_logprobs": ref_logprobs,
+                    "values": [0.0] * len(response_tokens),  # GRPO doesn't have critic values
+                    "token_rewards": [0.0] * len(response_tokens),  # Token-level rewards (not computed in GRPO)
+                    "reward": 0.0,  # Will be updated with actual reward
+                    "step": step
+                }
+                
+                # Add sample attributes from inputs if available
+                if i < len(inputs):
+                    sample["solution"] = inputs[i].get("solution", "")
+                    sample["problem"] = inputs[i].get("problem", "")
+                
+                rollout_samples.append(sample)
+            
+            # Save to file
+            filename = f"rollout_step_{step}_rank_{self.accelerator.process_index}.jsonl"
+            filepath = os.path.join(self.rollout_data_dir, filename)
+            
+            with open(filepath, "a", encoding="utf-8") as f:
+                for sample in rollout_samples:
+                    f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                    
+        except Exception as e:
+            print(f"Warning: Failed to save rollout data: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]], model) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
@@ -700,7 +795,8 @@ class VLMGRPOTrainer(Trainer):
 
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
 
-        return {
+        # Prepare outputs for RLLoggingBoard data collection
+        outputs = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
@@ -708,8 +804,68 @@ class VLMGRPOTrainer(Trainer):
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
-            "multimodal_inputs": multimodal_inputs
+            "multimodal_inputs": multimodal_inputs,
+            "rewards": rewards,  # Add rewards for RLLoggingBoard
         }
+        
+        # Save rollout data for RLLoggingBoard if enabled
+        if self.save_rollout_data:
+            try:
+                # Update rollout samples with actual rewards
+                rollout_samples = []
+                prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)
+                completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+                
+                for i in range(len(inputs)):
+                    # Get the response and mask for this sample
+                    completion_ids_i = completion_ids[i]
+                    completion_mask_i = completion_mask[i]
+                    
+                    # Get valid tokens (where mask is True)
+                    valid_indices = completion_mask_i.bool()
+                    valid_completion_ids = completion_ids_i[valid_indices]
+                    
+                    # Convert tokens to strings
+                    # Use tokenizer instead of processor for convert_ids_to_tokens
+                    if hasattr(self.processing_class, 'tokenizer'):
+                        response_tokens = self.processing_class.tokenizer.convert_ids_to_tokens(valid_completion_ids.tolist())
+                    else:
+                        # Fallback: decode and re-encode to get token strings
+                        response_text = self.processing_class.decode(valid_completion_ids.tolist())
+                        response_tokens = response_text.split() if response_text else []
+                    
+                    # Get logprobs for valid tokens
+                    ref_logprobs = []
+                    if ref_per_token_logps is not None and i < ref_per_token_logps.size(0):
+                        valid_ref_logprobs = ref_per_token_logps[i][valid_indices]
+                        ref_logprobs = valid_ref_logprobs.detach().cpu().tolist()
+                    
+                    # Create sample for RLLoggingBoard
+                    sample = {
+                        "prompt": prompts_text[i] if i < len(prompts_text) else str(inputs[i]["prompt"]),
+                        "response": completions[i],
+                        "response_tokens": response_tokens,
+                        "logprobs": [],  # Will be filled in compute_loss
+                        "ref_logprobs": ref_logprobs,
+                        "values": [0.0] * len(response_tokens),  # GRPO doesn't have critic values
+                        "token_rewards": [0.0] * len(response_tokens),  # Token-level rewards (not computed in GRPO)
+                        "reward": rewards[i].item() if i < len(rewards) else 0.0,
+                        "step": self.state.global_step
+                    }
+                    
+                    # Add sample attributes from inputs if available
+                    sample["solution"] = inputs[i].get("solution", "")
+                    sample["problem"] = inputs[i].get("problem", "")
+                    
+                    rollout_samples.append(sample)
+                
+                # Store rollout samples for later saving in compute_loss
+                outputs["rollout_samples"] = rollout_samples
+                
+            except Exception as e:
+                print(f"Warning: Failed to prepare rollout data: {e}")
+        
+        return outputs
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -768,6 +924,30 @@ class VLMGRPOTrainer(Trainer):
         is_clipped = (per_token_loss1 < per_token_loss2).float()
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
+
+        # Save rollout data with logprobs if enabled
+        if self.save_rollout_data and "rollout_samples" in inputs:
+            try:
+                rollout_samples = inputs["rollout_samples"]
+                completion_mask = inputs["completion_mask"]
+                
+                # Update rollout samples with logprobs
+                for i, sample in enumerate(rollout_samples):
+                    if i < per_token_logps.size(0) and i < completion_mask.size(0):
+                        valid_indices = completion_mask[i].bool()
+                        valid_logprobs = per_token_logps[i][valid_indices]
+                        sample["logprobs"] = valid_logprobs.detach().cpu().tolist()
+                
+                # Save to file
+                filename = f"rollout_step_{self.state.global_step}_rank_{self.accelerator.process_index}.jsonl"
+                filepath = os.path.join(self.rollout_data_dir, filename)
+                
+                with open(filepath, "a", encoding="utf-8") as f:
+                    for sample in rollout_samples:
+                        f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                        
+            except Exception as e:
+                print(f"Warning: Failed to save rollout data in compute_loss: {e}")
 
         return loss
 
